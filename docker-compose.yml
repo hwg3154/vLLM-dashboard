@@ -4,14 +4,22 @@ services:
     container_name: vllm-dashboard
     restart: unless-stopped
 
-    # Localhost only. Point cloudflared at it, or change to "8501:8501"
-    # to reach it from the LAN.
-    ports:
-      - "127.0.0.1:8501:8501"
+    # Host networking: the dashboard shares the host's network namespace, so
+    # vLLM is simply on 127.0.0.1:8000. This avoids the bridge entirely --
+    # going via host.docker.internal (the host-gateway IP) gets dropped when
+    # the host firewall filters the docker bridge, or when vLLM publishes its
+    # port bound to 127.0.0.1 only.
+    #
+    # "ports:" is ignored under host networking. BIND_HOST is what keeps the
+    # dashboard on loopback instead of every interface -- do not set it to
+    # 0.0.0.0 on a shared machine. Point cloudflared at 127.0.0.1:8501.
+    network_mode: host
 
     environment:
       VLLM_CONTAINER: ${VLLM_CONTAINER:-vllm-vllm-1}
-      VLLM_METRICS_URL: ${VLLM_METRICS_URL:-http://host.docker.internal:8000/metrics}
+      VLLM_METRICS_URL: ${VLLM_METRICS_URL:-http://127.0.0.1:8000/metrics}
+      BIND_HOST: ${BIND_HOST:-127.0.0.1}
+      BIND_PORT: ${BIND_PORT:-8501}
       POLL_INTERVAL: ${POLL_INTERVAL:-2}
       HISTORY_MINUTES: ${HISTORY_MINUTES:-30}
       SHOW_HEALTH_LOGS: ${SHOW_HEALTH_LOGS:-0}
@@ -20,10 +28,6 @@ services:
       # nvidia-smi only. "utility" means no CUDA runtime is injected.
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: utility
-
-    # Reaches vLLM on the host's published port 8000.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
     volumes:
       # :ro stops writes to the socket file, NOT to the Docker API.
@@ -37,3 +41,16 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu, utility]
+
+# Alternative to host networking: join vLLM's own compose network and scrape it
+# by container name. Use this if host networking is unavailable. Swap
+# "network_mode: host" above for the two blocks below, set
+# VLLM_METRICS_URL=http://vllm:8000/metrics, and restore
+# ports: ["127.0.0.1:8501:8501"] plus BIND_HOST=0.0.0.0.
+#
+#    networks: [default, vllm]
+#
+# networks:
+#   vllm:
+#     external: true
+#     name: ${VLLM_NETWORK:-vllm_default}

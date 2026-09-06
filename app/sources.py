@@ -44,14 +44,33 @@ def sleep_state(prom_data) -> str:
     return "unknown"
 
 
+def _explain_scrape(url: str, exc: Exception) -> str:
+    """ConnectTimeout with an empty str() tells the user nothing. Say more."""
+    name = type(exc).__name__
+    detail = str(exc).strip()
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return (
+            f"can't reach {url} ({name}). The dashboard has no route to vLLM. "
+            f"With network_mode: host, vLLM is on 127.0.0.1:8000; across a "
+            f"bridge, put both containers on one network and scrape by name."
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{url} returned HTTP {exc.response.status_code}"
+    return f"{name}: {detail}" if detail else f"{name} while scraping {url}"
+
+
 class MetricsSource:
     """Scrapes the Prometheus endpoint and turns counters into rates."""
 
-    def __init__(self, url: str, timeout: float = 5.0):
+    def __init__(self, url: str, timeout: float = 5.0,
+                 discover: Callable[[], Any] | None = None):
         self.url = url
+        self.configured_url = url
         self.timeout = timeout
+        self.discover = discover
         self.ok = False
         self.error: str | None = None
+        self.tried: list[str] = []
         self._prev: tuple[float, dict[str, float]] | None = None
         self._baseline: dict[str, Any] = {}
         self._client = httpx.AsyncClient(timeout=timeout)
@@ -59,16 +78,40 @@ class MetricsSource:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def poll(self, now: float) -> dict[str, Any]:
+    async def _fetch(self, url: str) -> str | None:
         try:
-            resp = await self._client.get(self.url)
+            resp = await self._client.get(url)
             resp.raise_for_status()
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
+            self.error = _explain_scrape(url, exc)
+            return None
+        return resp.text
+
+    async def _fallback(self) -> str | None:
+        """Configured URL is dead. Ask Docker where vLLM actually answers."""
+        configured_error = self.error
+        try:
+            candidates = [u for u in await self.discover() if u != self.url]
+        except Exception:  # noqa: BLE001 - discovery is best-effort
+            return None
+        for url in candidates:
+            text = await self._fetch(url)
+            if text is not None:
+                self.url = url  # stick with whatever works
+                return text
+        self.tried = candidates
+        self.error = configured_error
+        return None
+
+    async def poll(self, now: float) -> dict[str, Any]:
+        text = await self._fetch(self.url)
+        if text is None and self.discover is not None:
+            text = await self._fallback()
+        if text is None:
             self.ok = False
-            self.error = f"{type(exc).__name__}: {exc}"
-            return {"ok": False, "error": self.error}
-        self.ok, self.error = True, None
-        return self._derive(prom.parse(resp.text), now)
+            return {"ok": False, "error": self.error, "tried": self.tried}
+        self.ok, self.error, self.tried = True, None, []
+        return self._derive(prom.parse(text), now)
 
     def _derive(self, data, now: float) -> dict[str, Any]:
         counters = {
@@ -185,6 +228,55 @@ def _as_float(v: str | None) -> float | None:
         return None
 
 
+def _container_ports(info: dict[str, Any], fallback: int) -> list[int]:
+    ports: list[int] = []
+    for source in (
+        (info.get("NetworkSettings") or {}).get("Ports") or {},
+        (info.get("Config") or {}).get("ExposedPorts") or {},
+    ):
+        for spec in source:
+            try:
+                port = int(str(spec).split("/")[0])
+            except ValueError:
+                continue
+            if port not in ports:
+                ports.append(port)
+    return ports or [fallback]
+
+
+async def discover_metrics_urls(socket_path: str, container: str,
+                                path: str = "/metrics", fallback_port: int = 8000) -> list[str]:
+    """Every address the vLLM container might answer on, per the Docker API.
+
+    Only runs when the configured URL is already failing, so the cost of
+    opening a short-lived socket client here does not matter.
+    """
+    transport = httpx.AsyncHTTPTransport(uds=socket_path)
+    async with httpx.AsyncClient(transport=transport, base_url="http://docker") as client:
+        resp = await client.get(f"/containers/{container}/json", timeout=10)
+        resp.raise_for_status()
+        info = resp.json()
+
+    urls: list[str] = []
+
+    def add(host: str, port: int) -> None:
+        url = f"http://{host}:{port}{path}"
+        if url not in urls:
+            urls.append(url)
+
+    networks = ((info.get("NetworkSettings") or {}).get("Networks") or {})
+    name = (info.get("Name") or "").lstrip("/")
+    for port in _container_ports(info, fallback_port):
+        # DNS name first: it survives a container restart, an IP does not.
+        if name:
+            add(name, port)
+        for net in networks.values():
+            if net.get("IPAddress"):
+                add(net["IPAddress"], port)
+        add("127.0.0.1", port)
+    return urls
+
+
 # --- 2. nvidia-smi ------------------------------------------------------
 
 GPU_FIELDS = [
@@ -244,12 +336,12 @@ class GpuSource:
 
     async def poll(self) -> dict[str, Any]:
         if not self.available:
-            return {"ok": False, "error": self.error, "gpus": [], "procs": []}
+            return {"ok": False, "error": self.error, "gpus": [], "totals": {}, "procs": []}
         raw = await self._run(
             "--query-gpu=" + ",".join(GPU_FIELDS), "--format=csv,noheader,nounits"
         )
         if raw is None:
-            return {"ok": False, "error": self.error, "gpus": [], "procs": []}
+            return {"ok": False, "error": self.error, "gpus": [], "totals": {}, "procs": []}
 
         gpus = []
         for line in raw.strip().splitlines():
@@ -277,7 +369,29 @@ class GpuSource:
                     {"pid": _as_int(cells[0]), "name": cells[1].split("/")[-1], "mem_mb": _as_float(cells[2])}
                 )
         procs.sort(key=lambda p: -(p["mem_mb"] or 0))
-        return {"ok": True, "error": None, "gpus": gpus, "procs": procs[:8]}
+        return {"ok": True, "error": None, "gpus": gpus,
+                "totals": gpu_totals(gpus), "procs": procs[:8]}
+
+
+def gpu_totals(gpus: list[dict[str, Any]]) -> dict[str, Any]:
+    """Whole-box roll-up: what every card together is drawing and holding."""
+    def summed(key: str) -> float | None:
+        values = [g[key] for g in gpus if g.get(key) is not None]
+        return round(sum(values), 2) if values else None
+
+    utils = [g["util_pct"] for g in gpus if g.get("util_pct") is not None]
+    temps = [g["temp_c"] for g in gpus if g.get("temp_c") is not None]
+    power, limit = summed("power_w"), summed("power_limit_w")
+    return {
+        "count": len(gpus),
+        "power_w": power,
+        "power_limit_w": limit,
+        "power_pct": round(power / limit * 100.0, 1) if power is not None and limit else None,
+        "mem_used_mb": summed("mem_used_mb"),
+        "mem_total_mb": summed("mem_total_mb"),
+        "util_pct": round(sum(utils) / len(utils), 1) if utils else None,
+        "temp_max_c": max(temps) if temps else None,
+    }
 
 
 # --- 3. docker logs -----------------------------------------------------

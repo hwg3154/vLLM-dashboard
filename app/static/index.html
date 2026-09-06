@@ -82,6 +82,10 @@
   .kv { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: 13px; }
   .kv span:last-child { color: var(--ink); }
   .kv span:first-child { color: var(--muted); }
+  /* whole-box roll-up above the per-card list */
+  .total { border-bottom: 1px solid var(--rule); padding-bottom: 11px; margin-bottom: 13px; }
+  .total .watts { font-size: 21px; font-weight: 600; color: var(--ink); line-height: 1.1; }
+  .total .watts small { font-size: 13px; font-weight: 400; color: var(--muted); }
   .gpu-name { font-size: 13px; margin-bottom: 8px; }
   .gpu-name b { font-weight: 600; }
   .gpu-name em { font-style: normal; color: var(--faint); margin-right: 7px; }
@@ -212,12 +216,13 @@
   <div class="row c2">
     <div class="panel">
       <h2>GPU <span class="aside" id="gpu-note"></span></h2>
+      <div id="gpu-total"></div>
       <div id="gpus"></div>
       <div class="row c2" style="margin-top:12px">
         <div><div class="lbl">utilisation %</div><div class="mini"><canvas id="c-gpu-util"></canvas></div></div>
         <div><div class="lbl">memory %</div><div class="mini"><canvas id="c-gpu-mem"></canvas></div></div>
         <div><div class="lbl">temperature °C</div><div class="mini"><canvas id="c-gpu-temp"></canvas></div></div>
-        <div><div class="lbl">power W</div><div class="mini"><canvas id="c-gpu-power"></canvas></div></div>
+        <div><div class="lbl">system power W</div><div class="mini"><canvas id="c-gpu-power"></canvas></div></div>
       </div>
     </div>
     <div class="panel">
@@ -393,7 +398,11 @@ function renderCharts(gpuCount) {
   draw($("c-gpu-util"), gseries("gu"), { max: 100, fmtAxis: (v) => Math.round(v) + "%" });
   draw($("c-gpu-mem"), gseries("gm"), { max: 100, fmtAxis: (v) => Math.round(v) + "%" });
   draw($("c-gpu-temp"), gseries("gt"), { minMax: 90, fmtAxis: (v) => Math.round(v) + "°" });
-  draw($("c-gpu-power"), gseries("gp"), { minMax: 100, fmtAxis: (v) => Math.round(v) + "W" });
+  // Power is the one metric worth seeing summed: it is what the box pulls
+  // from the wall. Per-GPU draw is still on each card's row above.
+  draw($("c-gpu-power"), [{
+    data: pick("gpwr"), color: "#f2a93b", fill: "rgba(242,169,59,0.13)", width: 1.8,
+  }], { minMax: 100, fmtAxis: (v) => Math.round(v) + "W" });
 }
 
 /* ---------- panels ---------- */
@@ -460,9 +469,26 @@ function renderVllm(v) {
   renderRows($("reasons"), Object.entries(v.finish_reasons || {})
     .filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1])
     .map(([k, n]) => [k, fmtCount(n)]), "No finished requests yet");
-  renderRows($("endpoints"), (v.endpoints || [])
-    .filter((e) => !["/health", "/metrics"].includes(e.handler))
-    .map((e) => [e.method + " " + e.handler, fmtCount(e.count)]), "No endpoint counters");
+}
+
+const NOISY_PATHS = ["/health", "/metrics", "/ping", "/version"];
+
+// vLLM exports no http_requests_total of its own -- that counter comes from an
+// instrumentation library it does not enable -- so the Prometheus endpoint list
+// is normally empty. The log tailer counts the same access lines, and keeps
+// working while /metrics is unreachable, so fall back to it.
+function renderEndpoints(v, logs) {
+  let rows = ((v && v.endpoints) || [])
+    .filter((e) => !NOISY_PATHS.includes(e.handler))
+    .map((e) => [e.method + " " + e.handler, fmtCount(e.count)]);
+
+  if (!rows.length) {
+    rows = ((logs && logs.access_counts) || [])
+      .filter(([key]) => !NOISY_PATHS.includes((key.split(" ")[1] || "").split("?")[0]))
+      .map(([key, n]) => [key, fmtCount(n)]);
+  }
+  renderRows($("endpoints"), rows,
+    logs && logs.connected ? "No requests seen yet" : "No endpoint counters");
 }
 
 const LAT_ROWS = [
@@ -507,8 +533,24 @@ function renderGpu(gpu) {
     $("gpus").innerHTML = `<div class="empty">${escapeHtml(
       (gpu && gpu.error) || "No GPUs visible to this container.")}</div>`;
     $("gpu-note").textContent = "";
+    $("gpu-total").innerHTML = "";
     return;
   }
+
+  const t = gpu.totals || {};
+  const hotTotal = t.temp_max_c >= 84 ? " hot" : t.temp_max_c >= 75 ? " warm" : "";
+  $("gpu-total").className = "total";
+  $("gpu-total").innerHTML = `
+    <div class="kv"><span>system power draw${
+      t.count ? " · " + t.count + " GPUs" : ""}</span><span></span></div>
+    <div class="watts">${t.power_w != null ? t.power_w.toFixed(0) : "—"} W <small>of ${
+      t.power_limit_w != null ? t.power_limit_w.toFixed(0) : "—"} W${
+      t.power_pct != null ? " · " + t.power_pct.toFixed(0) + "%" : ""}</small></div>
+    <div class="meter${hotTotal}"><i style="width:${Math.min(100, t.power_pct || 0)}%"></i></div>
+    <div class="kv"><span>memory</span><span>${fmtCount(t.mem_used_mb)} / ${
+      fmtCount(t.mem_total_mb)} MB</span></div>
+    <div class="kv"><span>mean utilisation · hottest card</span><span>${
+      fmtPct(t.util_pct, 0)} · ${t.temp_max_c != null ? t.temp_max_c + "°C" : "—"}</span></div>`;
   $("gpu-note").textContent = (gpu.procs || [])
     .slice(0, 1).map((p) => p.name + " " + fmtCount(p.mem_mb) + " MB").join("");
   $("gpus").innerHTML = gpus.map((g) => {
@@ -550,7 +592,13 @@ function renderHealth(data) {
 
   const problems = [];
   if (data.vllm && !data.vllm.ok) {
-    problems.push(`Can't reach <code>${escapeHtml(data.config.metrics_url)}</code> — ${escapeHtml(data.vllm.error || "")}`);
+    // The error text names the URL itself, so do not print it twice.
+    let msg = `vLLM metrics: ${escapeHtml(data.vllm.error || "unreachable")}`;
+    if ((data.vllm.tried || []).length) {
+      msg += `<br><span class="aside">Also tried, from the Docker API: ${
+        data.vllm.tried.map((u) => `<code>${escapeHtml(u)}</code>`).join(" ")}</span>`;
+    }
+    problems.push(msg);
   }
   if (data.logs && data.logs.enabled && !data.logs.connected) {
     problems.push(`Can't tail container <code>${escapeHtml(data.config.container)}</code> — ${escapeHtml(data.logs.error || "")}`);
@@ -594,6 +642,7 @@ async function tick() {
 
   renderHealth(data);
   renderVllm(data.vllm);
+  renderEndpoints(data.vllm, data.logs);
   renderGpu(data.gpu);
   renderCharts((data.gpu && data.gpu.gpus ? data.gpu.gpus.length : 0) || 1);
 }

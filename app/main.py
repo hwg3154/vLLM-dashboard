@@ -13,7 +13,7 @@ from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from .sources import DockerLogSource, GpuSource, MetricsSource
+from .sources import DockerLogSource, GpuSource, MetricsSource, discover_metrics_urls
 
 STATIC = Path(__file__).parent / "static"
 
@@ -23,7 +23,7 @@ def env(name: str, default: str) -> str:
 
 
 CONFIG = {
-    "metrics_url": env("VLLM_METRICS_URL", "http://host.docker.internal:8000/metrics"),
+    "metrics_url": env("VLLM_METRICS_URL", "http://127.0.0.1:8000/metrics"),
     "container": env("VLLM_CONTAINER", "vllm-vllm-1"),
     "docker_socket": env("DOCKER_SOCKET", "/var/run/docker.sock"),
     "poll_interval": float(env("POLL_INTERVAL", "2")),
@@ -51,7 +51,16 @@ class Store:
 
 
 store = Store()
-metrics_source = MetricsSource(CONFIG["metrics_url"])
+metrics_source = MetricsSource(
+    CONFIG["metrics_url"],
+    # Discovery reads the Docker socket, so it is only available to installs
+    # that mounted it. It runs only when the configured URL is failing.
+    discover=(
+        (lambda: discover_metrics_urls(CONFIG["docker_socket"], CONFIG["container"]))
+        if CONFIG["read_docker_logs"]
+        else None
+    ),
+)
 gpu_source = GpuSource()
 log_source: DockerLogSource | None = None
 
@@ -89,6 +98,7 @@ async def poll_loop() -> None:
                 "gm": [_pct(g.get("mem_used_mb"), g.get("mem_total_mb")) for g in gpus],
                 "gt": [g.get("temp_c") for g in gpus],
                 "gp": [g.get("power_w") for g in gpus],
+                "gpwr": (gpu.get("totals") or {}).get("power_w"),
             }
         )
         await asyncio.sleep(max(0.25, interval - (time.time() - cycle_start)))
@@ -122,7 +132,9 @@ async def api_state(request) -> JSONResponse:
             "now": time.time(),
             "config": {
                 "container": CONFIG["container"],
-                "metrics_url": CONFIG["metrics_url"],
+                # The live URL, which discovery may have moved off the configured one.
+                "metrics_url": metrics_source.url,
+                "metrics_url_configured": metrics_source.configured_url,
                 "poll_interval": CONFIG["poll_interval"],
                 "history_minutes": CONFIG["history_minutes"],
                 "dashboard_uptime_s": time.time() - store.started,

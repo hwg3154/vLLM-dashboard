@@ -2,7 +2,8 @@ import asyncio, json, os, sys, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from app import prom
-from app.sources import MetricsSource, Demuxer, DockerLogSource, sleep_state
+from app.sources import (MetricsSource, Demuxer, DockerLogSource, sleep_state,
+                         gpu_totals, _container_ports)
 
 text = open(os.path.join(ROOT, "tests", "fixture_metrics.txt")).read()
 data = prom.parse(text)
@@ -107,6 +108,39 @@ check("warn captured", "warn" in kinds, True)
 check("500 flagged", ("bad-request" in kinds), True)
 check("request events", kinds.count("request"), 2)
 print("events:", *[f"\n   {k:<12} {t}" for k,t in events])
+
+# --- gpu roll-up ---------------------------------------------------
+# Readings taken from the live 4x RTX A5000 box while idle.
+four = [
+    {"index":0,"util_pct":0.0,"mem_used_mb":22644.0,"mem_total_mb":24564.0,"temp_c":37.0,"power_w":19.43,"power_limit_w":230.0},
+    {"index":1,"util_pct":0.0,"mem_used_mb":22999.0,"mem_total_mb":24564.0,"temp_c":54.0,"power_w":25.11,"power_limit_w":230.0},
+    {"index":2,"util_pct":0.0,"mem_used_mb":22607.0,"mem_total_mb":24564.0,"temp_c":54.0,"power_w":23.07,"power_limit_w":230.0},
+    {"index":3,"util_pct":0.0,"mem_used_mb":22607.0,"mem_total_mb":24564.0,"temp_c":52.0,"power_w":22.87,"power_limit_w":230.0},
+]
+t = gpu_totals(four)
+check("gpu count", t["count"], 4)
+check("system power sum", t["power_w"], 90.48)
+check("system power limit", t["power_limit_w"], 920.0)
+check("system power pct", t["power_pct"], 9.8)
+check("system mem used", t["mem_used_mb"], 90857.0)
+check("hottest card", t["temp_max_c"], 54.0)
+check("mean utilisation", t["util_pct"], 0.0)
+
+# A card that reports "[N/A]" for a field must not zero out the total.
+partial = gpu_totals([{"power_w": 10.0, "temp_c": 60.0}, {"power_w": None, "temp_c": None}])
+check("partial power kept", partial["power_w"], 10.0)
+check("partial limit absent", partial["power_limit_w"], None)
+check("no limit means no pct", partial["power_pct"], None)
+check("empty roll-up", gpu_totals([])["power_w"], None)
+
+# --- metrics url discovery ------------------------------------------
+inspect_fixture = {
+    "Name": "/vllm-vllm-1",
+    "Config": {"ExposedPorts": {"8000/tcp": {}}},
+    "NetworkSettings": {"Ports": {"8000/tcp": None}, "Networks": {"vllm_default": {"IPAddress": "172.18.0.2"}}},
+}
+check("ports parsed", _container_ports(inspect_fixture, 9999), [8000])
+check("port fallback", _container_ports({}, 8000), [8000])
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}"))
 sys.exit(1 if fails else 0)

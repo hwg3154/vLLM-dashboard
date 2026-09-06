@@ -50,24 +50,44 @@ Copy `.env.example` to `.env` and edit, or leave it out entirely for the default
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `VLLM_CONTAINER` | `vllm-vllm-1` | From `docker ps --format '{{.Names}}'` |
-| `VLLM_METRICS_URL` | `http://host.docker.internal:8000/metrics` | See below if port 8000 isn't published |
+| `VLLM_METRICS_URL` | `http://127.0.0.1:8000/metrics` | Host networking puts vLLM on loopback; see below |
+| `BIND_HOST` | `127.0.0.1` | Under host networking there is no port mapping. Do not use `0.0.0.0` on a shared machine |
+| `BIND_PORT` | `8501` | |
 | `POLL_INTERVAL` | `2` | Seconds between scrapes; also the chart resolution |
 | `HISTORY_MINUTES` | `30` | In-memory ring buffer, cleared on restart |
 | `SHOW_HEALTH_LOGS` | `0` | Set to `1` to include `/health` and `/metrics` polls in the feed |
 | `LOG_TAIL` | `200` | Backlog lines read on attach |
 | `READ_DOCKER_LOGS` | `1` | Set to `0` to run without the Docker socket |
 
-If vLLM's port isn't published on the host, join its network instead and address
-it by service name:
+### Reaching vLLM
+
+The dashboard runs with `network_mode: host`, so vLLM is reachable at
+`127.0.0.1:8000` — the same address anything else on the host uses.
+
+The bridge alternative, `host.docker.internal` plus `extra_hosts:
+host-gateway`, does resolve on Linux, but the connection still dies with a
+`ConnectTimeout` in two common cases: a host firewall filtering the docker
+bridge, or vLLM publishing its port bound to `127.0.0.1` only, so the gateway
+address has nothing listening. Host networking sidesteps both.
+
+If host networking is unavailable, join vLLM's own network and address it by
+service name instead (there is a commented block in `docker-compose.yml`):
 
 ```yaml
-    networks: [vllm_default]          # docker network ls to find the real name
+    networks: [default, vllm]
     environment:
       VLLM_METRICS_URL: http://vllm:8000/metrics
+      BIND_HOST: 0.0.0.0               # a port mapping protects it again
+    ports: ["127.0.0.1:8501:8501"]
 networks:
-  vllm_default:
+  vllm:
     external: true
+    name: vllm_default                 # docker network ls for the real name
 ```
+
+Whichever you choose, a failed scrape is self-diagnosing: the dashboard asks
+the Docker API where the vLLM container actually answers, tries those
+addresses, and adopts the first that works. The banner lists what it tried.
 
 ## About the Docker socket
 
@@ -92,10 +112,13 @@ keeps working. Each source degrades independently.
 **"no container named …"** — check `docker ps --format '{{.Names}}'` and set
 `VLLM_CONTAINER`. Compose names are usually `<project>-<service>-<n>`.
 
-**"Can't reach http://host.docker.internal:8000/metrics"** — confirm the port is
-published (`0.0.0.0:8000->8000/tcp` in `docker ps`) and that `extra_hosts` is
-present. Test from inside: `docker exec vllm-dashboard python -c "import
-urllib.request;print(urllib.request.urlopen('http://host.docker.internal:8000/health').status)"`.
+**"can't reach … (ConnectTimeout)"** — the dashboard has no route to vLLM. Under
+host networking, check vLLM is actually on loopback: `curl -s -o /dev/null -w
+'%{http_code}\n' http://127.0.0.1:8000/health` from the host itself. A
+`ConnectTimeout` rather than a refusal points at a firewall dropping the
+traffic; a refusal means nothing is listening on that address. The banner also
+lists the addresses discovery found via the Docker API — if one of those works,
+set it as `VLLM_METRICS_URL`.
 
 **"nvidia-smi unavailable"** — the container needs the NVIDIA runtime. If the
 `deploy.resources` block doesn't work on your Docker version, replace it with
