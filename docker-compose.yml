@@ -1,0 +1,39 @@
+services:
+  dashboard:
+    build: .
+    container_name: vllm-dashboard
+    restart: unless-stopped
+
+    # Localhost only. Point cloudflared at it, or change to "8501:8501"
+    # to reach it from the LAN.
+    ports:
+      - "127.0.0.1:8501:8501"
+
+    environment:
+      VLLM_CONTAINER: ${VLLM_CONTAINER:-vllm-vllm-1}
+      VLLM_METRICS_URL: ${VLLM_METRICS_URL:-http://host.docker.internal:8000/metrics}
+      POLL_INTERVAL: ${POLL_INTERVAL:-2}
+      HISTORY_MINUTES: ${HISTORY_MINUTES:-30}
+      SHOW_HEALTH_LOGS: ${SHOW_HEALTH_LOGS:-0}
+      LOG_TAIL: ${LOG_TAIL:-200}
+      READ_DOCKER_LOGS: ${READ_DOCKER_LOGS:-1}
+      # nvidia-smi only. "utility" means no CUDA runtime is injected.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: utility
+
+    # Reaches vLLM on the host's published port 8000.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # :ro stops writes to the socket file, NOT to the Docker API.
+      # Anything that can reach this socket is effectively root on the host.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
