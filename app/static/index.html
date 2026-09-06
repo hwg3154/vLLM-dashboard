@@ -4,7 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>vLLM telemetry</title>
+<script>
+  // Runs before the stylesheet paints: a theme read from localStorage after
+  // first paint would show a frame of the wrong one.
+  try {
+    var t = localStorage.getItem("theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  } catch (err) { /* private mode: stay on the default */ }
+</script>
 <style>
+  /* Dark is the default -- this dashboard lives on a wall display. Light is an
+     opt-in override on <html>, set before first paint by the inline script in
+     the head so there is no flash of the wrong theme.
+     The chart canvases read their colours out of these same variables, so a
+     hue only ever needs changing here. */
   :root {
     --ground: #1b1714;
     --panel: #232019;
@@ -16,10 +29,44 @@
     --amber: #f2a93b;
     --teal: #5fbfa8;
     --rust: #d9663d;
+    --indigo: #8f9ed6;
+    --amber-fill: rgba(242, 169, 59, 0.13);
+    --teal-fill: rgba(95, 191, 168, 0.13);
+    --grid: rgba(242, 233, 220, 0.09);
+    --guide-soft: rgba(242, 233, 220, 0.10);
+    --guide-hard: rgba(242, 233, 220, 0.34);
+    --dot-halo: #12100e;
+    --tip-bg: rgba(28, 24, 20, 0.95);
+    --tip-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
     --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
   }
+  /* The accents are darkened rather than reused: #f2a93b on paper is roughly
+     1.8:1, unreadable as a 1px chart line or as small label text. */
+  :root[data-theme="light"] {
+    --ground: #f6f2ea;
+    --panel: #fffdf8;
+    --panel-2: #e9e1d4;
+    --ink: #241f1a;
+    --muted: #6b6053;
+    --faint: #9a8e7d;
+    --rule: rgba(36, 31, 26, 0.14);
+    --amber: #a86a08;
+    --teal: #1b7b65;
+    --rust: #b0431d;
+    --indigo: #4a58a8;
+    --amber-fill: rgba(168, 106, 8, 0.12);
+    --teal-fill: rgba(27, 123, 101, 0.12);
+    --grid: rgba(36, 31, 26, 0.11);
+    --guide-soft: rgba(36, 31, 26, 0.12);
+    --guide-hard: rgba(36, 31, 26, 0.40);
+    --dot-halo: #fffdf8;
+    --tip-bg: rgba(255, 253, 248, 0.97);
+    --tip-shadow: 0 4px 14px rgba(36, 31, 26, 0.18);
+  }
   * { box-sizing: border-box; }
+  :root { color-scheme: dark; }
+  :root[data-theme="light"] { color-scheme: light; }
   html, body { margin: 0; background: var(--ground); }
   body {
     font-family: var(--sans);
@@ -54,11 +101,14 @@
   .state { display: inline-flex; align-items: center; gap: 8px; padding: 5px 11px 5px 9px;
            border: 1px solid var(--rule); border-radius: 999px; font-size: 13px; }
   .state .dot { width: 8px; height: 8px; }
-  .state.awake { color: var(--teal); border-color: rgba(95,191,168,.4); }
+  .state.awake { color: var(--teal); border-color: rgba(95,191,168,.4);
+                 border-color: color-mix(in srgb, currentColor 45%, transparent); }
   .state.awake .dot { background: var(--teal); }
-  .state.asleep { color: var(--amber); border-color: rgba(242,169,59,.4); }
+  .state.asleep { color: var(--amber); border-color: rgba(242,169,59,.4);
+                  border-color: color-mix(in srgb, currentColor 45%, transparent); }
   .state.asleep .dot { background: var(--amber); }
-  .state.gone { color: var(--rust); border-color: rgba(217,102,61,.45); }
+  .state.gone { color: var(--rust); border-color: rgba(217,102,61,.45);
+                border-color: color-mix(in srgb, currentColor 45%, transparent); }
   .state.gone .dot { background: var(--rust); }
   .hero-right { margin-left: auto; display: flex; gap: 34px; align-items: flex-end; }
   .stat-n { font-size: 26px; font-weight: 300; line-height: 1; }
@@ -112,6 +162,20 @@
   .feed .error .t, .feed .warn .t { color: var(--ink); white-space: normal; }
   .empty { color: var(--faint); font-size: 13px; padding: 6px 0; }
 
+  /* chart hover readout */
+  #chart-tip {
+    position: fixed; z-index: 10; display: none; pointer-events: none;
+    background: var(--tip-bg); border: 1px solid var(--rule); border-radius: 3px;
+    padding: 6px 8px; font-family: var(--mono); font-size: 11px; line-height: 1.5;
+    white-space: nowrap; box-shadow: var(--tip-shadow); color: var(--ink);
+  }
+  #chart-tip .tip-head { color: var(--muted); border-bottom: 1px solid var(--rule);
+                         margin-bottom: 4px; padding-bottom: 3px; }
+  #chart-tip .tip-row { display: flex; align-items: center; gap: 6px; }
+  #chart-tip .tip-row i { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  #chart-tip .tip-label { color: var(--muted); }
+  #chart-tip .tip-val { margin-left: auto; padding-left: 12px; color: var(--ink); }
+
   /* controls */
   button {
     font: inherit; font-size: 12px; color: var(--muted); background: transparent;
@@ -125,12 +189,15 @@
   .sep { display: inline-flex; gap: 6px; margin-left: 4px;
          padding-left: 10px; border-left: 1px solid var(--rule); }
   button[disabled] { opacity: .45; cursor: default; }
-  button.danger:hover { color: var(--amber); border-color: rgba(242,169,59,.5); }
+  button.danger:hover { color: var(--amber); border-color: rgba(242,169,59,.5);
+                        border-color: color-mix(in srgb, currentColor 50%, transparent); }
 
   .banner { border: 1px solid rgba(217,102,61,.45); background: rgba(217,102,61,.09);
+            border-color: color-mix(in srgb, var(--rust) 45%, transparent);
+            background: color-mix(in srgb, var(--rust) 9%, transparent);
             color: var(--ink); padding: 10px 13px; border-radius: 3px; margin-top: 14px; font-size: 13px; }
   .banner code { font-family: var(--mono); color: var(--amber); font-size: 12px; }
-  canvas { width: 100%; display: block; }
+  canvas { width: 100%; display: block; cursor: crosshair; }
 
   @media (max-width: 1000px) {
     .row.c4 { grid-template-columns: 1fr 1fr; }
@@ -144,6 +211,7 @@
 </style>
 </head>
 <body>
+<div id="chart-tip" aria-hidden="true"></div>
 <div class="wrap">
 
   <header>
@@ -154,6 +222,7 @@
       <span id="h-docker"><i class="dot"></i>logs</span>
       <span id="h-gpu"><i class="dot"></i>gpu</span>
       <button id="pause" aria-pressed="false">Pause</button>
+      <button id="theme" title="Switch between the light and dark palette">Light</button>
       <span class="sep" id="control-group" hidden>
         <button id="btn-wake" title="POST /wake_up on vLLM">Wake</button>
         <button id="btn-sleep" class="danger" title="POST /sleep on vLLM: frees VRAM">Sleep</button>
@@ -277,10 +346,27 @@ const state = { hist: [], cursor: 0, since: 0, paused: false, window: "session",
                 events: [], last: null, controlError: null, hover: null };
 const $ = (id) => document.getElementById(id);
 
-// The one array a hover readout can key off: every chart shares this x axis of
-// sample times, so the tooltip can print the clock time beside the values.
+const PAD_T = 10, PAD_B = 14, PAD_R = 2;
+
+// Every chart is drawn over the same x axis of sample times, so one array
+// carries the clock time a hover readout keys off. chartSpecs remembers what
+// each canvas last drew, so a hover can redraw just that canvas instead of
+// repeating every argument the call site happened to pass.
 let chartTimes = [];
-let chartSpecs = [];
+const chartSpecs = new Map();
+const tip = () => $("chart-tip");
+
+// Canvas has no cascade, so the chart colours are read out of the CSS
+// variables once per theme change and cached -- getComputedStyle in the middle
+// of a draw would force a style recalc on every hover frame.
+const CHART_VARS = ["amber", "teal", "rust", "indigo", "amber-fill", "teal-fill",
+                    "grid", "guide-soft", "guide-hard", "dot-halo", "faint"];
+const C = {};
+function readTheme() {
+  const cs = getComputedStyle(document.documentElement);
+  for (const name of CHART_VARS) C[name] = cs.getPropertyValue("--" + name).trim();
+}
+readTheme();
 
 /* ---------- formatting ---------- */
 const fmtCount = (v) => {
@@ -308,8 +394,9 @@ const fmtDur = (s) => {
 const clockOf = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour12: false });
 
 /* ---------- charts ---------- */
-function draw(canvas, series, opts, hover) {
+function draw(canvas, series, opts) {
   opts = opts || {};
+  chartSpecs.set(canvas, { series, opts });
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth || 300;
   const h = canvas.parentElement.clientHeight || 80;
@@ -322,7 +409,7 @@ function draw(canvas, series, opts, hover) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
-  const padT = 10, padB = 14, padR = 2;
+  const padT = PAD_T, padB = PAD_B, padR = PAD_R;
   const plotH = Math.max(10, h - padT - padB);
 
   // A prefill burst of a few thousand tok/s and a steady 60 tok/s of
@@ -346,7 +433,7 @@ function draw(canvas, series, opts, hover) {
   const yFor = (max) => (v) => padT + plotH - (v / max) * plotH;
 
   // baseline + one mid gridline
-  ctx.strokeStyle = "rgba(242,233,220,0.09)";
+  ctx.strokeStyle = C.grid;
   ctx.lineWidth = 1;
   for (const frac of [0, 0.5, 1]) {
     const gy = Math.round(padT + plotH * frac) + 0.5;
@@ -356,7 +443,7 @@ function draw(canvas, series, opts, hover) {
   ctx.textBaseline = "top";
   const fmtVal = (v) => String(opts.fmtAxis ? opts.fmtAxis(v) : Math.round(v));
   if (shared !== null) {
-    ctx.fillStyle = "#6d6355";
+    ctx.fillStyle = C.faint;
     ctx.fillText(fmtVal(shared), 2, 0);
   } else {
     // Each scale is drawn in its series' colour so it is unambiguous which
@@ -409,98 +496,133 @@ function draw(canvas, series, opts, hover) {
     }
   }
 
-  // Hover readout: a vertical guide to the nearest sample, a dot on each line
-  // there, and a tooltip listing the value of every series at that instant.
-  // Hovering is a full redraw of this one canvas, so the lines redraw whole —
-  // cheaper than tracking dirty regions and free of stale-pixel seams.
-  if (hover) {
+  // Hover readout: a vertical guide dropped from the hovered sample to the x
+  // axis, a dot where each line crosses it, and a DOM tooltip listing every
+  // series' value at that instant. Hovering redraws this one canvas whole --
+  // cheaper than tracking dirty regions and free of stale-pixel seams. The
+  // tooltip lives in the DOM, not on the canvas: these plots are 80-130px
+  // tall, so a canvas-drawn box would be clipped by its own chart.
+  const hover = state.hover && state.hover.canvas === canvas ? state.hover : null;
+  if (hover && chartTimes.length) {
     const idx = Math.max(0, Math.min(n - 1,
       Math.round(((hover.x - padR) / (w - padR * 2)) * (n - 1))));
-    const cx = x(idx);
-
-    ctx.strokeStyle = "rgba(242,233,220,0.28)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(Math.round(cx) + 0.5, padT);
-    ctx.lineTo(Math.round(cx) + 0.5, padT + plotH);
-    ctx.stroke();
+    const cx = Math.round(x(idx)) + 0.5;
+    const base = padT + plotH;
 
     const rows = [];
+    let topY = base;
     for (const [si, s] of series.entries()) {
       const v = s.data[idx];
       if (v === null || v === undefined) continue;
       const yy = yFor(maxes[si])(v);
-      ctx.beginPath();
-      ctx.fillStyle = s.color;
-      ctx.arc(cx, yy, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-      const nm = s.label || (opts.seriesLabel ? opts.seriesLabel + (series.length > 1 ? " " + (si + 1) : "") : "value");
-      rows.push([nm, fmtVal(v), s.color]);
+      if (yy < topY) topY = yy;
+      rows.push({ label: s.name || s.label || opts.seriesLabel || "value",
+                  text: fmtVal(v), color: s.color, y: yy });
     }
 
-    if (rows.length) {
-      const lines = [];
-      if (chartTimes[idx] != null) lines.push(["", clockOf(chartTimes[idx]), "#a2947f"]);
-      for (const [label, text, color] of rows) lines.push([label, text, color]);
+    // Faint the whole plot height so the guide still reads where a series has
+    // a gap; solid from the axis up to the highest point on it.
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = C["guide-soft"];
+    ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, base); ctx.stroke();
+    ctx.strokeStyle = C["guide-hard"];
+    ctx.beginPath(); ctx.moveTo(cx, base); ctx.lineTo(cx, Math.min(base, topY)); ctx.stroke();
 
-      ctx.font = "11px ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
-      let tw = 0;
-      for (const [label, text] of lines) {
-        const lw = ctx.measureText(label + "  " + text).width;
-        if (lw > tw) tw = lw;
-      }
-      const rowH = 15, pad = 7;
-      const boxW = tw + pad * 2;
-      const boxH = lines.length * rowH + pad * 2 - 3;
-      let bx = cx + 12;
-      if (bx + boxW > w - 2) bx = Math.max(2, cx - 12 - boxW);
-      let by = (hover.y > h * 0.6 ? hover.y - 14 - boxH : hover.y + 14);
-      by = Math.max(2, Math.min(h - boxH - 2, by));
-
-      ctx.fillStyle = "rgba(28,24,20,0.95)";
-      ctx.strokeStyle = "rgba(242,233,220,0.16)";
-      ctx.lineWidth = 1;
+    for (const r of rows) {
       ctx.beginPath();
-      ctx.rect(bx, by, boxW, boxH);
+      ctx.fillStyle = C["dot-halo"];
+      ctx.arc(cx, r.y, 3.6, 0, Math.PI * 2);
       ctx.fill();
-      ctx.stroke();
-
-      ctx.textBaseline = "top";
-      lines.forEach((ln, i) => {
-        const [label, text, color] = ln;
-        ctx.fillStyle = color;
-        const ty = by + pad + i * rowH;
-        // swatch keyed to the series, so a label of "GPU 1" ties to its line
-        ctx.fillText(label ? label + "  " + text : text, bx + pad, ty);
-      });
+      ctx.beginPath();
+      ctx.fillStyle = r.color;
+      ctx.arc(cx, r.y, 2.4, 0, Math.PI * 2);
+      ctx.fill();
     }
+
+    showTip(hover, chartTimes[idx], rows);
   }
+}
+
+/* ---------- hover ---------- */
+function showTip(hover, ts, rows) {
+  const el = tip();
+  if (!rows.length) { hideTip(); return; }
+  el.innerHTML =
+    `<div class="tip-head">${escapeHtml(ts != null ? clockOf(ts) : "")}</div>` +
+    rows.map((r) => `<div class="tip-row"><i style="background:${r.color}"></i>` +
+      `<span class="tip-label">${escapeHtml(r.label)}</span>` +
+      `<span class="tip-val">${escapeHtml(r.text)}</span></div>`).join("");
+  el.style.display = "block";
+
+  // Measure after filling, then flip to whichever side of the cursor fits.
+  const box = el.getBoundingClientRect();
+  let left = hover.cx + 14;
+  if (left + box.width > window.innerWidth - 6) left = hover.cx - 14 - box.width;
+  let top = hover.cy - box.height - 12;
+  if (top < 6) top = hover.cy + 16;
+  el.style.left = Math.max(6, left) + "px";
+  el.style.top = Math.min(window.innerHeight - box.height - 6, top) + "px";
+}
+
+function hideTip() { tip().style.display = "none"; }
+
+function redrawHovered() {
+  const spec = state.hover && chartSpecs.get(state.hover.canvas);
+  if (spec) draw(state.hover.canvas, spec.series, spec.opts);
+}
+
+// One listener per canvas, bound once. Charts are static in the markup, so
+// there is nothing to rebind when the data behind them changes.
+for (const canvas of document.querySelectorAll("canvas")) {
+  canvas.addEventListener("mousemove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    const prev = state.hover && state.hover.canvas;
+    state.hover = { canvas, x: e.clientX - r.left, y: e.clientY - r.top,
+                    cx: e.clientX, cy: e.clientY };
+    // Moving between charts leaves a guide behind on the one just left.
+    if (prev && prev !== canvas) {
+      const spec = chartSpecs.get(prev);
+      if (spec) { const h = state.hover; state.hover = null; draw(prev, spec.series, spec.opts); state.hover = h; }
+    }
+    redrawHovered();
+  });
+  canvas.addEventListener("mouseleave", () => {
+    const spec = chartSpecs.get(canvas);
+    state.hover = null;
+    hideTip();
+    if (spec) draw(canvas, spec.series, spec.opts);
+  });
 }
 
 const pick = (key) => state.hist.map((p) => p[key]);
 const pickGpu = (key, i) => state.hist.map((p) => (p[key] && p[key].length > i ? p[key][i] : null));
 
-const GPU_COLORS = ["#5fbfa8", "#f2a93b", "#d9663d", "#8f9ed6"];
+const gpuColors = () => [C.teal, C.amber, C.rust, C.indigo];
 
 function renderCharts(gpuCount) {
+  // The x axis every chart shares, so a hover can name the instant it is over.
+  chartTimes = state.hist.map((p) => p.t);
+
   // Generation is the sustained number you watch, so it owns the left axis;
   // prefill spikes into the thousands and reads off the right.
   draw($("c-throughput"), [
-    { data: pick("gtps"), color: "#f2a93b", fill: "rgba(242,169,59,0.13)", label: "generation", labelRow: 0, width: 1.8 },
-    { data: pick("ptps"), color: "#5fbfa8", label: "prefill", labelRow: 1 },
+    { data: pick("gtps"), color: C.amber, fill: C["amber-fill"], label: "generation", labelRow: 0, width: 1.8 },
+    { data: pick("ptps"), color: C.teal, label: "prefill", labelRow: 1 },
   ], { minMax: 20, fmtAxis: (v) => Math.round(v) + " tok/s", perSeriesScale: true });
 
-  draw($("c-kv"), [{ data: pick("kv"), color: "#5fbfa8", fill: "rgba(95,191,168,0.13)" }],
+  draw($("c-kv"), [{ data: pick("kv"), color: C.teal, fill: C["teal-fill"], name: "used" }],
     { max: 100, fmtAxis: (v) => Math.round(v) + "%" });
 
   draw($("c-queue"), [
-    { data: pick("run"), color: "#f2a93b", fill: "rgba(242,169,59,0.13)", label: "running", labelRow: 0 },
-    { data: pick("wait"), color: "#d9663d", label: "waiting", labelRow: 1 },
+    { data: pick("run"), color: C.amber, fill: C["amber-fill"], label: "running", labelRow: 0 },
+    { data: pick("wait"), color: C.rust, label: "waiting", labelRow: 1 },
   ], { minMax: 4, fmtAxis: (v) => Math.round(v) });
 
+  const colors = gpuColors();
   const gseries = (key) => Array.from({ length: gpuCount }, (_, i) => ({
-    data: pickGpu(key, i), color: GPU_COLORS[i % GPU_COLORS.length],
-    fill: gpuCount === 1 ? "rgba(95,191,168,0.12)" : null,
+    data: pickGpu(key, i), color: colors[i % colors.length],
+    fill: gpuCount === 1 ? C["teal-fill"] : null,
+    name: gpuCount > 1 ? "GPU " + i : "GPU",
   }));
   draw($("c-gpu-util"), gseries("gu"), { max: 100, fmtAxis: (v) => Math.round(v) + "%" });
   draw($("c-gpu-mem"), gseries("gm"), { max: 100, fmtAxis: (v) => Math.round(v) + "%" });
@@ -508,7 +630,8 @@ function renderCharts(gpuCount) {
   // Power is the one metric worth seeing summed: it is what the box pulls
   // from the wall. Per-GPU draw is still on each card's row above.
   draw($("c-gpu-power"), [{
-    data: pick("gpwr"), color: "#f2a93b", fill: "rgba(242,169,59,0.13)", width: 1.8,
+    data: pick("gpwr"), color: C.amber, fill: C["amber-fill"], width: 1.8,
+    name: "all GPUs",
   }], { minMax: 100, fmtAxis: (v) => Math.round(v) + "W" });
 }
 
@@ -851,8 +974,32 @@ for (const [id, win] of [["win-session", "session"], ["win-all", "all"]]) {
     tick();
   });
 }
-window.addEventListener("resize", () => renderCharts(
-  document.querySelectorAll("#gpus .gpu-name").length || 1));
+/* ---------- theme ---------- */
+const gpuCount = () => document.querySelectorAll("#gpus .gpu-name").length || 1;
+
+function applyTheme(name) {
+  document.documentElement.dataset.theme = name;
+  // The button offers the theme you are not in, the way a play/pause does not.
+  $("theme").textContent = name === "light" ? "Dark" : "Light";
+  readTheme();
+  // The tooltip is styled by CSS, but a guide already on a canvas is painted
+  // pixels: redraw so it is not left in the outgoing palette.
+  renderCharts(gpuCount());
+}
+
+applyTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+
+$("theme").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  applyTheme(next);
+  try { localStorage.setItem("theme", next); } catch (err) { /* not persisted */ }
+});
+
+window.addEventListener("resize", () => {
+  state.hover = null;
+  hideTip();
+  renderCharts(gpuCount());
+});
 
 tick();
 setInterval(tick, 2000);
