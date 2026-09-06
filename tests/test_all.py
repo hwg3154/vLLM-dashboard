@@ -1,9 +1,10 @@
-import asyncio, json, sys, time
-sys.path.insert(0, "/home/claude/vllmdash")
+import asyncio, json, os, sys, time
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 from app import prom
 from app.sources import MetricsSource, Demuxer, DockerLogSource, sleep_state
 
-text = open("tests/fixture_metrics.txt").read()
+text = open(os.path.join(ROOT, "tests", "fixture_metrics.txt")).read()
 data = prom.parse(text)
 fails = []
 
