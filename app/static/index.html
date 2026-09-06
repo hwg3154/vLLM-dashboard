@@ -121,6 +121,11 @@
   button[aria-pressed="true"] { color: var(--ground); background: var(--muted); border-color: var(--muted); }
   button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
   .controls { display: flex; gap: 6px; }
+  /* engine controls sit apart from the view controls: they change the server */
+  .sep { display: inline-flex; gap: 6px; margin-left: 4px;
+         padding-left: 10px; border-left: 1px solid var(--rule); }
+  button[disabled] { opacity: .45; cursor: default; }
+  button.danger:hover { color: var(--amber); border-color: rgba(242,169,59,.5); }
 
   .banner { border: 1px solid rgba(217,102,61,.45); background: rgba(217,102,61,.09);
             color: var(--ink); padding: 10px 13px; border-radius: 3px; margin-top: 14px; font-size: 13px; }
@@ -149,6 +154,10 @@
       <span id="h-docker"><i class="dot"></i>logs</span>
       <span id="h-gpu"><i class="dot"></i>gpu</span>
       <button id="pause" aria-pressed="false">Pause</button>
+      <span class="sep" id="control-group" hidden>
+        <button id="btn-wake" title="POST /wake_up on vLLM">Wake</button>
+        <button id="btn-sleep" class="danger" title="POST /sleep on vLLM: frees VRAM">Sleep</button>
+      </span>
     </div>
   </header>
 
@@ -264,7 +273,8 @@
 "use strict";
 
 const CAP = 1200;
-const state = { hist: [], cursor: 0, since: 0, paused: false, window: "session", onlyErrors: false, events: [] };
+const state = { hist: [], cursor: 0, since: 0, paused: false, window: "session", onlyErrors: false,
+                events: [], last: null, controlError: null };
 const $ = (id) => document.getElementById(id);
 
 /* ---------- formatting ---------- */
@@ -631,6 +641,9 @@ function renderHealth(data) {
   if (data.gpu && !data.gpu.ok && data.gpu.error) {
     problems.push(`nvidia-smi unavailable — ${escapeHtml(data.gpu.error)}`);
   }
+  if (state.controlError) {
+    problems.push(`Engine control — ${escapeHtml(state.controlError)}`);
+  }
   $("banner").innerHTML = problems.length
     ? `<div class="banner">${problems.join("<br>")}</div>` : "";
 }
@@ -665,12 +678,87 @@ async function tick() {
   }
   state.cursor = data.event_cursor;
 
+  state.last = data;
   renderHealth(data);
   renderVllm(data.vllm);
   renderEndpoints(data.vllm, data.logs);
   renderGpu(data.gpu);
   renderCharts((data.gpu && data.gpu.gpus ? data.gpu.gpus.length : 0) || 1);
+  $("control-group").hidden = !(data.config && data.config.controls_enabled);
 }
+
+/* ---------- engine control ---------- */
+// A token is only needed if the server sets CONTROL_TOKEN. Accept it once via
+// ?token=... , keep it in localStorage, and strip it back out of the address
+// bar so it does not sit in history or get copy-pasted into a share.
+(function adoptToken() {
+  try {
+    const url = new URL(window.location.href);
+    const t = url.searchParams.get("token");
+    if (t) {
+      localStorage.setItem("controlToken", t);
+      url.searchParams.delete("token");
+      history.replaceState(null, "", url.pathname + url.search + url.hash);
+    }
+  } catch (err) { /* private mode, or no localStorage: controls just stay open */ }
+})();
+
+function controlToken() {
+  try { return localStorage.getItem("controlToken") || ""; } catch (err) { return ""; }
+}
+
+let controlBusy = false;
+
+async function sendControl(path, body, button) {
+  if (controlBusy) return;
+  controlBusy = true;
+  const buttons = [$("btn-wake"), $("btn-sleep")];
+  const label = button.textContent;
+  button.textContent = "…";
+  buttons.forEach((b) => (b.disabled = true));
+  try {
+    const headers = { "Content-Type": "application/json" };
+    const token = controlToken();
+    if (token) headers["X-Control-Token"] = token;
+    const resp = await fetch("/api/control/" + path, {
+      method: "POST", headers, body: JSON.stringify(body || {}),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.ok) {
+      let msg = data.error || `HTTP ${resp.status}`;
+      if (resp.status === 403 && !token) {
+        msg += ". Open the dashboard once with ?token=YOUR_TOKEN to store it.";
+      }
+      state.controlError = msg;
+    } else {
+      state.controlError = null;
+    }
+  } catch (err) {
+    state.controlError = String(err);
+  } finally {
+    controlBusy = false;
+    button.textContent = label;
+    buttons.forEach((b) => (b.disabled = false));
+    // Sleep and wake take a moment to land; re-poll rather than wait 2s.
+    tick();
+    setTimeout(tick, 1200);
+  }
+}
+
+$("btn-wake").addEventListener("click", (e) => sendControl("wake", {}, e.currentTarget));
+
+$("btn-sleep").addEventListener("click", (e) => {
+  const v = (state.last && state.last.vllm) || {};
+  const q = v.ok ? v.queue : null;
+  const busy = q ? Math.round(q.running + q.waiting) : 0;
+  // Sleeping evicts the KV cache, so anything mid-flight dies with it.
+  if (busy > 0 && !confirm(
+      `${busy} request(s) are in flight and will be dropped. Sleep anyway?`)) {
+    return;
+  }
+  const level = (state.last && state.last.config && state.last.config.sleep_level) || 2;
+  sendControl("sleep", { level }, e.currentTarget);
+});
 
 /* ---------- controls ---------- */
 $("pause").addEventListener("click", (e) => {

@@ -2,8 +2,9 @@ import asyncio, json, os, sys, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from app import prom
+import httpx
 from app.sources import (MetricsSource, Demuxer, DockerLogSource, sleep_state,
-                         gpu_totals, _container_ports)
+                         gpu_totals, _container_ports, EngineControl, base_url_of)
 
 text = open(os.path.join(ROOT, "tests", "fixture_metrics.txt")).read()
 data = prom.parse(text)
@@ -141,6 +142,56 @@ inspect_fixture = {
 }
 check("ports parsed", _container_ports(inspect_fixture, 9999), [8000])
 check("port fallback", _container_ports({}, 8000), [8000])
+
+# --- engine control -------------------------------------------------
+for url, want in [
+    ("http://127.0.0.1:8000/metrics", "http://127.0.0.1:8000"),
+    ("http://vllm-vllm-1:8000/metrics", "http://vllm-vllm-1:8000"),
+    ("https://vllm.internal:443/metrics", "https://vllm.internal:443"),
+    ("http://127.0.0.1:8000", "http://127.0.0.1:8000"),
+]:
+    check(f"base_url_of {url}", base_url_of(url), want)
+
+seen = {}
+
+def _record(request, status=200, text=""):
+    seen.clear()
+    seen.update(method=request.method, url=str(request.url),
+                params=dict(request.url.params), body=request.content.decode())
+    return httpx.Response(status, text=text)
+
+async def _exercise(handler):
+    ctl = EngineControl(lambda: "http://vllm:8000")
+    ctl._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    out = {}
+    out["sleep"] = await ctl.sleep(2)
+    out["sleep_seen"] = dict(seen)
+    out["wake"] = await ctl.wake()
+    out["wake_seen"] = dict(seen)
+    await ctl.close()
+    return out
+
+r = asyncio.run(_exercise(_record))
+check("sleep succeeds", r["sleep"]["ok"], True)
+check("sleep is a POST", r["sleep_seen"]["method"], "POST")
+check("sleep path", r["sleep_seen"]["url"].split("?")[0], "http://vllm:8000/sleep")
+# vLLM reads level from the query string; the body is belt and braces.
+check("sleep level in query", r["sleep_seen"]["params"].get("level"), "2")
+check("sleep level in body", json.loads(r["sleep_seen"]["body"] or "{}").get("level"), 2)
+check("wake path", r["wake_seen"]["url"], "http://vllm:8000/wake_up")
+check("wake sends no body", r["wake_seen"]["body"], "")
+check("wake succeeds", r["wake"]["ok"], True)
+
+r404 = asyncio.run(_exercise(lambda req: _record(req, 404, "Not Found")))
+check("404 surfaces failure", r404["sleep"]["ok"], False)
+check("404 explains dev mode", "VLLM_SERVER_DEV_MODE" in r404["sleep"]["error"], True)
+
+def _boom(request):
+    raise httpx.ConnectError("nope", request=request)
+
+rerr = asyncio.run(_exercise(_boom))
+check("connect error handled", rerr["sleep"]["ok"], False)
+check("connect error names url", "http://vllm:8000/sleep" in rerr["sleep"]["error"], True)
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}"))
 sys.exit(1 if fails else 0)

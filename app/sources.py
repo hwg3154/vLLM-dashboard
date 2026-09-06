@@ -6,6 +6,7 @@ import re
 import shutil
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -394,7 +395,60 @@ def gpu_totals(gpus: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-# --- 3. docker logs -----------------------------------------------------
+# --- 3. engine control --------------------------------------------------
+
+def base_url_of(metrics_url: str) -> str:
+    """http://host:8000/metrics -> http://host:8000
+
+    Derived from the live metrics URL so that controls follow discovery: if
+    the scraper moved to a working address, the buttons move with it.
+    """
+    parsed = urlsplit(metrics_url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+class EngineControl:
+    """POSTs vLLM's /sleep and /wake_up.
+
+    vLLM reads the sleep level from the query string, not the request body --
+    a body-only call silently sleeps at level 1. Send it both ways so the
+    requested level survives either implementation.
+    """
+
+    def __init__(self, base_url: Callable[[], str], timeout: float = 120.0):
+        self._base_url = base_url
+        self._client = httpx.AsyncClient(timeout=timeout)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def _post(self, path: str, params: dict[str, str] | None,
+                    body: dict[str, Any] | None) -> dict[str, Any]:
+        url = self._base_url().rstrip("/") + path
+        try:
+            resp = await self._client.post(url, params=params, json=body)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip()[:200]
+            hint = ""
+            if exc.response.status_code == 404:
+                hint = (" -- /sleep and /wake_up only exist when vLLM runs with "
+                        "VLLM_SERVER_DEV_MODE=1")
+            return {"ok": False, "status": exc.response.status_code,
+                    "error": f"vLLM returned HTTP {exc.response.status_code}{hint}"
+                             + (f": {detail}" if detail else "")}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": _explain_scrape(url, exc)}
+        return {"ok": True, "status": resp.status_code, "url": url}
+
+    async def sleep(self, level: int) -> dict[str, Any]:
+        return await self._post("/sleep", {"level": str(level)}, {"level": level})
+
+    async def wake(self) -> dict[str, Any]:
+        return await self._post("/wake_up", None, None)
+
+
+# --- 4. docker logs -----------------------------------------------------
 
 ENGINE_LINE = "Avg prompt throughput"
 ENGINE_FIELDS = {

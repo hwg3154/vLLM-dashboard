@@ -13,7 +13,8 @@ from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from .sources import DockerLogSource, GpuSource, MetricsSource, discover_metrics_urls
+from .sources import (DockerLogSource, EngineControl, GpuSource, MetricsSource,
+                      base_url_of, discover_metrics_urls)
 
 STATIC = Path(__file__).parent / "static"
 
@@ -31,6 +32,12 @@ CONFIG = {
     "log_tail": int(env("LOG_TAIL", "200")),
     "show_health_logs": env("SHOW_HEALTH_LOGS", "0") not in ("0", "false", "no", ""),
     "read_docker_logs": env("READ_DOCKER_LOGS", "1") not in ("0", "false", "no"),
+    # Sleep/wake buttons. These change the served model's state, so anyone who
+    # can open the dashboard can stop it serving. Set CONTROL_TOKEN if the
+    # dashboard is reachable by anyone you would not trust to do that.
+    "enable_controls": env("ENABLE_CONTROLS", "1") not in ("0", "false", "no"),
+    "control_token": env("CONTROL_TOKEN", ""),
+    "sleep_level": int(env("SLEEP_LEVEL", "2")),
 }
 
 
@@ -62,6 +69,8 @@ metrics_source = MetricsSource(
     ),
 )
 gpu_source = GpuSource()
+# Follows metrics_source.url, so discovery fixes the controls too.
+engine_control = EngineControl(lambda: base_url_of(metrics_source.url))
 log_source: DockerLogSource | None = None
 
 
@@ -138,6 +147,9 @@ async def api_state(request) -> JSONResponse:
                 "poll_interval": CONFIG["poll_interval"],
                 "history_minutes": CONFIG["history_minutes"],
                 "dashboard_uptime_s": time.time() - store.started,
+                "controls_enabled": CONFIG["enable_controls"],
+                "controls_need_token": bool(CONFIG["control_token"]),
+                "sleep_level": CONFIG["sleep_level"],
             },
             "vllm": store.vllm,
             "gpu": store.gpu,
@@ -163,6 +175,51 @@ async def api_state(request) -> JSONResponse:
             "event_cursor": store.event_seq,
         }
     )
+
+
+def _control_refused(request) -> JSONResponse | None:
+    """Controls change what the server does, so they are gated separately."""
+    if not CONFIG["enable_controls"]:
+        return JSONResponse(
+            {"ok": False, "error": "controls are disabled (ENABLE_CONTROLS=0)"}, status_code=403
+        )
+    token = CONFIG["control_token"]
+    if token and request.headers.get("x-control-token") != token:
+        return JSONResponse(
+            {"ok": False, "error": "missing or wrong control token"}, status_code=403
+        )
+    return None
+
+
+async def _run_control(request, what: str, action) -> JSONResponse:
+    refused = _control_refused(request)
+    if refused is not None:
+        return refused
+    result = await action()
+    if result["ok"]:
+        store.add_event("state", f"{what} requested from the dashboard")
+    else:
+        store.add_event("error", f"{what} failed: {result.get('error', '')}"[:300])
+    return JSONResponse(result, status_code=200 if result["ok"] else 502)
+
+
+async def api_sleep(request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - an empty or junk body just means "default"
+        body = {}
+    try:
+        level = int(body.get("level", CONFIG["sleep_level"]))
+    except (TypeError, ValueError):
+        level = CONFIG["sleep_level"]
+    if level not in (1, 2):
+        return JSONResponse({"ok": False, "error": "level must be 1 or 2"}, status_code=400)
+    return await _run_control(request, f"Sleep level {level}",
+                              lambda: engine_control.sleep(level))
+
+
+async def api_wake(request) -> JSONResponse:
+    return await _run_control(request, "Wake-up", engine_control.wake)
 
 
 async def index(request) -> FileResponse:
@@ -193,6 +250,7 @@ async def lifespan(app):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await metrics_source.close()
+        await engine_control.close()
         if log_source:
             await log_source.close()
 
@@ -201,6 +259,8 @@ app = Starlette(
     routes=[
         Route("/", index),
         Route("/api/state", api_state),
+        Route("/api/control/sleep", api_sleep, methods=["POST"]),
+        Route("/api/control/wake", api_wake, methods=["POST"]),
         Route("/healthz", healthz),
     ],
     lifespan=lifespan,

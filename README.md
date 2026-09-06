@@ -58,6 +58,39 @@ Copy `.env.example` to `.env` and edit, or leave it out entirely for the default
 | `SHOW_HEALTH_LOGS` | `0` | Set to `1` to include `/health` and `/metrics` polls in the feed |
 | `LOG_TAIL` | `200` | Backlog lines read on attach |
 | `READ_DOCKER_LOGS` | `1` | Set to `0` to run without the Docker socket |
+| `ENABLE_CONTROLS` | `1` | Sleep/wake buttons. `0` removes them and refuses the endpoints |
+| `CONTROL_TOKEN` | *(empty)* | If set, controls require it. See below |
+| `SLEEP_LEVEL` | `2` | Level the Sleep button asks for: 1 offloads weights, 2 also discards the KV cache |
+
+### Sleep and wake
+
+The header has **Wake** and **Sleep** buttons, posting to vLLM's `/wake_up` and
+`/sleep`. Sleeping is what frees the VRAM; level 2 discards the KV cache as well
+as offloading weights. The buttons target whatever host the metrics scrape
+settled on, so discovery fixes them too.
+
+Two things to know:
+
+- vLLM reads the sleep level from the **query string**, not the request body.
+  `curl -X POST .../sleep -d '{"level": 2}'` sends a body the handler ignores and
+  sleeps at level 1. The dashboard sends the level both ways.
+- `/sleep` and `/wake_up` exist only when vLLM runs with `VLLM_SERVER_DEV_MODE=1`.
+  A 404 from these buttons means that flag is missing, and the banner says so.
+
+**These endpoints are as exposed as the dashboard is.** Anyone who can load the
+page can stop your server from serving. If it is reachable beyond your own
+machine — behind a tunnel, on a LAN — either put an authenticating proxy in
+front, set `ENABLE_CONTROLS=0`, or set a token:
+
+```bash
+CONTROL_TOKEN=$(openssl rand -hex 16)
+```
+
+Then open the dashboard once as `https://…/?token=YOUR_TOKEN`. It is kept in
+`localStorage` and stripped from the address bar, so it stays out of your
+history and out of any link you paste. The token is sent as a header over
+whatever transport you are using: it keeps honest strangers out, it is not a
+substitute for TLS and real auth.
 
 ### Reaching vLLM
 

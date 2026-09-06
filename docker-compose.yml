@@ -25,6 +25,11 @@ services:
       SHOW_HEALTH_LOGS: ${SHOW_HEALTH_LOGS:-0}
       LOG_TAIL: ${LOG_TAIL:-200}
       READ_DOCKER_LOGS: ${READ_DOCKER_LOGS:-1}
+      # Sleep/wake buttons. Anyone who can load the dashboard can use them:
+      # set CONTROL_TOKEN, or ENABLE_CONTROLS=0, if it is reachable off-box.
+      ENABLE_CONTROLS: ${ENABLE_CONTROLS:-1}
+      CONTROL_TOKEN: ${CONTROL_TOKEN:-}
+      SLEEP_LEVEL: ${SLEEP_LEVEL:-2}
       # nvidia-smi only. "utility" means no CUDA runtime is injected.
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: utility
