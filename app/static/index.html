@@ -274,8 +274,13 @@
 
 const CAP = 1200;
 const state = { hist: [], cursor: 0, since: 0, paused: false, window: "session", onlyErrors: false,
-                events: [], last: null, controlError: null };
+                events: [], last: null, controlError: null, hover: null };
 const $ = (id) => document.getElementById(id);
+
+// The one array a hover readout can key off: every chart shares this x axis of
+// sample times, so the tooltip can print the clock time beside the values.
+let chartTimes = [];
+let chartSpecs = [];
 
 /* ---------- formatting ---------- */
 const fmtCount = (v) => {
@@ -303,7 +308,7 @@ const fmtDur = (s) => {
 const clockOf = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour12: false });
 
 /* ---------- charts ---------- */
-function draw(canvas, series, opts) {
+function draw(canvas, series, opts, hover) {
   opts = opts || {};
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth || 300;
@@ -401,6 +406,73 @@ function draw(canvas, series, opts) {
       ctx.textBaseline = "bottom";
       ctx.fillText(s.label + " " + (opts.fmtAxis ? opts.fmtAxis(last) : last), 2, h - 1 - (s.labelRow || 0) * 12);
       ctx.textBaseline = "top";
+    }
+  }
+
+  // Hover readout: a vertical guide to the nearest sample, a dot on each line
+  // there, and a tooltip listing the value of every series at that instant.
+  // Hovering is a full redraw of this one canvas, so the lines redraw whole —
+  // cheaper than tracking dirty regions and free of stale-pixel seams.
+  if (hover) {
+    const idx = Math.max(0, Math.min(n - 1,
+      Math.round(((hover.x - padR) / (w - padR * 2)) * (n - 1))));
+    const cx = x(idx);
+
+    ctx.strokeStyle = "rgba(242,233,220,0.28)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(Math.round(cx) + 0.5, padT);
+    ctx.lineTo(Math.round(cx) + 0.5, padT + plotH);
+    ctx.stroke();
+
+    const rows = [];
+    for (const [si, s] of series.entries()) {
+      const v = s.data[idx];
+      if (v === null || v === undefined) continue;
+      const yy = yFor(maxes[si])(v);
+      ctx.beginPath();
+      ctx.fillStyle = s.color;
+      ctx.arc(cx, yy, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      const nm = s.label || (opts.seriesLabel ? opts.seriesLabel + (series.length > 1 ? " " + (si + 1) : "") : "value");
+      rows.push([nm, fmtVal(v), s.color]);
+    }
+
+    if (rows.length) {
+      const lines = [];
+      if (chartTimes[idx] != null) lines.push(["", clockOf(chartTimes[idx]), "#a2947f"]);
+      for (const [label, text, color] of rows) lines.push([label, text, color]);
+
+      ctx.font = "11px ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
+      let tw = 0;
+      for (const [label, text] of lines) {
+        const lw = ctx.measureText(label + "  " + text).width;
+        if (lw > tw) tw = lw;
+      }
+      const rowH = 15, pad = 7;
+      const boxW = tw + pad * 2;
+      const boxH = lines.length * rowH + pad * 2 - 3;
+      let bx = cx + 12;
+      if (bx + boxW > w - 2) bx = Math.max(2, cx - 12 - boxW);
+      let by = (hover.y > h * 0.6 ? hover.y - 14 - boxH : hover.y + 14);
+      by = Math.max(2, Math.min(h - boxH - 2, by));
+
+      ctx.fillStyle = "rgba(28,24,20,0.95)";
+      ctx.strokeStyle = "rgba(242,233,220,0.16)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.rect(bx, by, boxW, boxH);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.textBaseline = "top";
+      lines.forEach((ln, i) => {
+        const [label, text, color] = ln;
+        ctx.fillStyle = color;
+        const ty = by + pad + i * rowH;
+        // swatch keyed to the series, so a label of "GPU 1" ties to its line
+        ctx.fillText(label ? label + "  " + text : text, bx + pad, ty);
+      });
     }
   }
 }
