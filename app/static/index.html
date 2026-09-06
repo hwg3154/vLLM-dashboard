@@ -309,15 +309,26 @@ function draw(canvas, series, opts) {
 
   const padT = 10, padB = 14, padR = 2;
   const plotH = Math.max(10, h - padT - padB);
-  let max = opts.max || 0;
-  for (const s of series) for (const v of s.data) if (v !== null && v !== undefined && v > max) max = v;
-  if (opts.minMax && max < opts.minMax) max = opts.minMax;
-  if (max <= 0) max = 1;
-  if (!opts.max) max *= 1.15;
+
+  // A prefill burst of a few thousand tok/s and a steady 60 tok/s of
+  // generation do not belong on one axis: the shared maximum flattens
+  // generation onto the baseline. perSeriesScale gives each series its own,
+  // read off the left and right edges like any dual-axis chart.
+  const peak = (group) => {
+    let max = opts.max || 0;
+    for (const s of group) {
+      for (const v of s.data) if (v !== null && v !== undefined && v > max) max = v;
+    }
+    if (opts.minMax && max < opts.minMax) max = opts.minMax;
+    if (max <= 0) max = 1;
+    return opts.max ? max : max * 1.15;
+  };
+  const shared = opts.perSeriesScale ? null : peak(series);
+  const maxes = series.map((s) => (shared === null ? peak([s]) : shared));
 
   const n = Math.max(...series.map((s) => s.data.length), 2);
   const x = (i) => padR + (i / (n - 1)) * (w - padR * 2);
-  const y = (v) => padT + plotH - (v / max) * plotH;
+  const yFor = (max) => (v) => padT + plotH - (v / max) * plotH;
 
   // baseline + one mid gridline
   ctx.strokeStyle = "rgba(242,233,220,0.09)";
@@ -326,13 +337,25 @@ function draw(canvas, series, opts) {
     const gy = Math.round(padT + plotH * frac) + 0.5;
     ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
   }
-  ctx.fillStyle = "#6d6355";
   ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
   ctx.textBaseline = "top";
-  ctx.fillText(opts.fmtAxis ? opts.fmtAxis(max) : Math.round(max), 2, 0);
+  const fmtVal = (v) => String(opts.fmtAxis ? opts.fmtAxis(v) : Math.round(v));
+  if (shared !== null) {
+    ctx.fillStyle = "#6d6355";
+    ctx.fillText(fmtVal(shared), 2, 0);
+  } else {
+    // Each scale is drawn in its series' colour so it is unambiguous which
+    // line it belongs to: first series left, second right.
+    series.slice(0, 2).forEach((s, i) => {
+      const text = fmtVal(maxes[i]);
+      ctx.fillStyle = s.color;
+      ctx.fillText(text, i === 0 ? 2 : w - ctx.measureText(text).width - 2, 0);
+    });
+  }
 
-  for (const s of series) {
+  for (const [si, s] of series.entries()) {
     const pts = s.data;
+    const y = yFor(maxes[si]);
     if (s.fill) {
       ctx.beginPath();
       let open = false;
@@ -378,10 +401,12 @@ const pickGpu = (key, i) => state.hist.map((p) => (p[key] && p[key].length > i ?
 const GPU_COLORS = ["#5fbfa8", "#f2a93b", "#d9663d", "#8f9ed6"];
 
 function renderCharts(gpuCount) {
+  // Generation is the sustained number you watch, so it owns the left axis;
+  // prefill spikes into the thousands and reads off the right.
   draw($("c-throughput"), [
     { data: pick("gtps"), color: "#f2a93b", fill: "rgba(242,169,59,0.13)", label: "generation", labelRow: 0, width: 1.8 },
     { data: pick("ptps"), color: "#5fbfa8", label: "prefill", labelRow: 1 },
-  ], { minMax: 20, fmtAxis: (v) => Math.round(v) + " tok/s" });
+  ], { minMax: 20, fmtAxis: (v) => Math.round(v) + " tok/s", perSeriesScale: true });
 
   draw($("c-kv"), [{ data: pick("kv"), color: "#5fbfa8", fill: "rgba(95,191,168,0.13)" }],
     { max: 100, fmtAxis: (v) => Math.round(v) + "%" });
