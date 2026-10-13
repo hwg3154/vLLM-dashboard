@@ -61,6 +61,8 @@ Copy `.env.example` to `.env` and edit, or leave it out entirely for the default
 | `ENABLE_CONTROLS` | `1` | Sleep/wake buttons. `0` removes them and refuses the endpoints |
 | `CONTROL_TOKEN` | *(empty)* | If set, controls require it. See below |
 | `SLEEP_LEVEL` | `2` | Level the Sleep button asks for: 1 offloads weights, 2 also discards the KV cache |
+| `AUTO_SLEEP_MINUTES` | `10` | Sleep the engine after this many idle minutes (0 = off). Overridden per-session by the "sleep after" input |
+| `WAKE_MODE` | `manual` | `manual` or `responsive`. Overridden per-session by the header toggle |
 
 ### Sleep and wake
 
@@ -68,6 +70,30 @@ The header has **Wake** and **Sleep** buttons, posting to vLLM's `/wake_up` and
 `/sleep`. Sleeping is what frees the VRAM; level 2 discards the KV cache as well
 as offloading weights. The buttons target whatever host the metrics scrape
 settled on, so discovery fixes them too.
+
+**Auto-sleep.** With `AUTO_SLEEP_MINUTES=10` (the default) the engine is put to
+sleep at `SLEEP_LEVEL` after ten minutes without token generation — "activity"
+means tokens actually flowing or a request running/waiting in the engine, not
+merely an open connection. The header's **sleep after** input overrides the
+minutes for the running session; entering `0` turns auto-sleep off. The small
+note in the header shows the current mode and how far the idle clock has run.
+Changing the input restarts the idle clock.
+
+**Wake mode.** The header's **manual** / **responsive** toggle (default manual,
+always manual on startup) decides who wakes the engine:
+
+- *manual* — the **Wake** button only, exactly as before.
+- *responsive* — the dashboard watches the container logs and, when it sees a
+  request land that the model would serve — `POST /v1/chat/completions`,
+  `POST /v1/completions` (GET of the same paths too) — it posts `/wake_up`
+  itself. A wake is issued at most once per request burst: the dashboard
+  latches while the wake is in flight and again until the engine reports awake
+  (120 s to declare it unconfirmed), so a client hammering the endpoint while
+  the engine wakes does not stack wake calls. Every wake is recorded in the
+  activity feed.
+
+Both overrides are per-session: they survive closing the tab but not restarting
+the container, which comes back to the env defaults.
 
 Two things to know:
 

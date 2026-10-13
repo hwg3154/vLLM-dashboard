@@ -193,5 +193,159 @@ rerr = asyncio.run(_exercise(_boom))
 check("connect error handled", rerr["sleep"]["ok"], False)
 check("connect error names url", "http://vllm:8000/sleep" in rerr["sleep"]["error"], True)
 
+# --- token activity --------------------------------------------------
+from app.sources import token_activity, WAKE_REQUEST_RE
+
+check("unreachable -> inactive", token_activity(None),
+      {"tokens": 0, "requests": 0, "gen_tps": 0.0, "active": False})
+check("unreachable dict -> inactive",
+      token_activity({"ok": False, "error": "x"})["active"], False)
+idle_vllm = {"ok": True, "session": {"generation_tokens": 5000, "requests": 40},
+             "rates": {"gen_tps": 0.0, "prompt_tps": 0.0, "req_per_min": 0.0},
+             "queue": {"running": 0, "waiting": 0}}
+# A big session total but nothing happening now is still idle.
+check("session totals do not count as activity", token_activity(idle_vllm)["active"], False)
+check("session totals still reported", token_activity(idle_vllm)["tokens"], 5000)
+busy = dict(idle_vllm, rates=dict(idle_vllm["rates"], gen_tps=42.0))
+check("gen_tps marks active", token_activity(busy)["active"], True)
+check("running request marks active",
+      token_activity(dict(idle_vllm, queue={"running": 2, "waiting": 0}))["active"], True)
+check("waiting request marks active",
+      token_activity(dict(idle_vllm, queue={"running": 0, "waiting": 1}))["active"], True)
+
+# --- wake-request detection -------------------------------------------
+lines = {
+    "POST /v1/chat/completions": True,
+    "POST /v1/completions": True,
+    "GET /v1/chat/completions": True,
+    "POST /v1/models": False,
+    "GET /v1/models": False,
+    "POST /health": False,
+    "POST /v1/embeddings": False,
+    "GET /metrics": False,
+    "POST /v1/chat/completions?stream=true": True,
+}
+for line, want in lines.items():
+    check(f"wake-request pattern: {line}", bool(WAKE_REQUEST_RE.match(line)), want)
+
+# End-to-end through _handle: access lines fire the callback, others don't.
+wakes = []
+ls2 = DockerLogSource.__new__(DockerLogSource)
+ls2.on_event = lambda k, t: None
+ls2.on_wake_request = lambda m, p: wakes.append((m, p))
+ls2.engine = {}; ls2.engine_at = None; ls2.access_counts = {}; ls2.show_noisy = False
+access_lines = [
+    '2026-10-13T12:25:36.0Z (APIServer pid=1) INFO: 10.1.2.3:5001 - "POST /v1/chat/completions HTTP/1.1" 200 OK',
+    '2026-10-13T12:25:36.1Z (APIServer pid=1) INFO: 10.1.2.3:5001 - "GET /v1/models HTTP/1.1" 200 OK',
+    '2026-10-13T12:25:37.0Z (APIServer pid=1) INFO: 10.1.2.3:5002 - "POST /v1/chat/completions HTTP/1.1" 503 Service Unavailable',
+    '2026-10-13T12:25:38.0Z (APIServer pid=1) INFO: 10.1.2.3:5003 - "GET /health HTTP/1.1" 200 OK',
+]
+for line in access_lines:
+    ls2._handle(line)
+check("wake callback fires per completions line", wakes,
+      [("POST", "/v1/chat/completions"), ("POST", "/v1/chat/completions")])
+check("/v1/models is not a wake request",
+      all(p == "/v1/chat/completions" for _, p in wakes), True)
+# A failed request (503) still wakes: the client wanted the model.
+check("failed request still counts", len(wakes) == 2, True)
+# No callback installed: nothing breaks.
+ls3 = DockerLogSource.__new__(DockerLogSource)
+ls3.on_event = lambda k, t: None
+ls3.engine = {}; ls3.engine_at = None; ls3.access_counts = {}; ls3.show_noisy = False
+for line in access_lines:
+    ls3._handle(line)  # must not raise
+
+# --- sleep policy ------------------------------------------------------
+# Import the app module: it reads env at import time.
+os.environ["AUTO_SLEEP_MINUTES"] = "0"  # keep the real app's policy quiet below
+from app import main as appmod
+
+policy = appmod.SleepPolicy()
+policy.idle_minutes = 10.0
+NOW = 1_000_000.0
+awake_idle = {"ok": True, "engine_state": "awake",
+              "session": {"generation_tokens": 0, "requests": 0},
+              "rates": {"gen_tps": 0.0, "prompt_tps": 0.0},
+              "queue": {"running": 0, "waiting": 0}}
+awake_busy = dict(awake_idle, rates={"gen_tps": 10.0, "prompt_tps": 0.0})
+
+policy.tick(NOW, awake_idle)                     # first poll: clock starts
+check("first poll arms nothing", policy.auto_sleep_armed, False)
+check("first poll records baseline", policy.last_activity == NOW, True)
+policy.tick(NOW + 599, awake_idle)               # 9 min 59 s idle
+check("9m59s idle does not arm", policy.auto_sleep_armed, False)
+policy.tick(NOW + 600, awake_idle)               # 10 min idle
+check("10m idle arms auto-sleep", policy.auto_sleep_armed, True)
+policy.tick(NOW + 602, awake_busy)               # tokens resume
+check("activity disarms", policy.auto_sleep_armed, False)
+check("activity refreshes the clock", policy.last_activity == NOW + 602, True)
+policy.tick(NOW + 603, awake_idle)
+check("idle clock restarted, not armed", policy.auto_sleep_armed, False)
+asleep = {"ok": True, "engine_state": "asleep_l2", "session": {}, "rates": {}, "queue": {}}
+policy.auto_sleep_armed = True
+policy.tick(NOW + 700, asleep)
+check("asleep state clears the arm", policy.auto_sleep_armed, False)
+
+# Disabled (0 minutes) never acts, whatever the state.
+off = appmod.SleepPolicy()
+off.idle_minutes = 0.0
+off.tick(NOW, awake_idle)
+check("disabled policy stays quiet", off.last_activity is None and not off.auto_sleep_armed, True)
+
+# Responsive wake: only in responsive mode, only while asleep, once at a time.
+woken = {"ok": 0}
+async def _wake_flow():
+    appmod.store.vllm = asleep
+    appmod.engine_control.wake = fake_wake
+    p = appmod.SleepPolicy()
+    p.wake_mode = "manual"
+    p.on_wake_request("POST", "/v1/chat/completions")
+    await asyncio.sleep(0.05)
+    manual_fired = woken["ok"]
+    p.wake_mode = "responsive"
+    p.on_wake_request("POST", "/v1/chat/completions")   # asleep -> fires
+    p.on_wake_request("POST", "/v1/chat/completions")   # mid-wake -> ignored
+    await asyncio.sleep(0.05)
+    responsive_fired = woken["ok"]
+    appmod.store.vllm = awake_idle                      # awake -> ignored
+    p.on_wake_request("POST", "/v1/chat/completions")
+    await asyncio.sleep(0.05)
+    awake_fired = woken["ok"]
+    return manual_fired, responsive_fired, awake_fired
+
+async def fake_wake():
+    woken["ok"] += 1
+    return {"ok": True, "status": 200}
+
+m, r, a = asyncio.run(_wake_flow())
+check("manual mode never auto-wakes", m, 0)
+check("responsive mode wakes once per request burst", r, 1)
+check("already-awake state ignored", a, 1)
+
+# The latch releases once tick() confirms the engine awake, and a later
+# request can then trigger a fresh wake.
+async def _refire_flow():
+    appmod.store.vllm = asleep
+    p = appmod.SleepPolicy()
+    p.idle_minutes = 10.0
+    p.wake_mode = "responsive"
+    woken["ok"] = 0
+    T = 2_000_000.0
+    p.on_wake_request("POST", "/v1/chat/completions")
+    p.on_wake_request("POST", "/v1/chat/completions")
+    await asyncio.sleep(0.02)
+    n1 = woken["ok"]
+    p.tick(T, awake_idle)             # wake confirmed: latch released
+    check("tick confirms the wake", p._waking, False)
+    check("confirmed wake refreshes idle clock", p.last_activity == T, True)
+    appmod.store.vllm = asleep
+    p.on_wake_request("POST", "/v1/chat/completions")
+    await asyncio.sleep(0.02)
+    return n1, woken["ok"]
+
+n1, n2 = asyncio.run(_refire_flow())
+check("first burst fires once", n1, 1)
+check("later request fires a fresh wake", n2, 2)
+
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}"))
 sys.exit(1 if fails else 0)

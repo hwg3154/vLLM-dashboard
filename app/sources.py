@@ -45,6 +45,33 @@ def sleep_state(prom_data) -> str:
     return "unknown"
 
 
+def token_activity(vllm: dict[str, Any] | None) -> dict[str, Any]:
+    """Is the engine doing any token work right now, and how much since boot.
+
+    "Active" is the live signal auto-sleep needs: tokens flowing in the last
+    poll interval, or a request running/waiting in the engine. The session
+    totals are lifetime-ish and only tell the story on the UI.
+    """
+    if not (vllm or {}).get("ok"):
+        return {"tokens": 0, "requests": 0, "gen_tps": 0.0, "active": False}
+    session = (vllm or {}).get("session") or {}
+    rates = (vllm or {}).get("rates") or {}
+    q = (vllm or {}).get("queue") or {}
+    gen_tps = rates.get("gen_tps", 0.0) or 0.0
+    prompt_tps = rates.get("prompt_tps", 0.0) or 0.0
+    return {
+        "tokens": int(session.get("generation_tokens", 0)),
+        "requests": int(session.get("requests", 0)),
+        "gen_tps": gen_tps,
+        "active": (
+            gen_tps >= 0.05
+            or prompt_tps >= 0.05
+            or (q.get("running", 0) or 0) > 0
+            or (q.get("waiting", 0) or 0) > 0
+        ),
+    }
+
+
 def _explain_scrape(url: str, exc: Exception) -> str:
     """ConnectTimeout with an empty str() tells the user nothing. Say more."""
     name = type(exc).__name__
@@ -467,6 +494,10 @@ ACCESS_RE = re.compile(
 WAKE_RE = re.compile(r"wake up the engine")
 SLEEP_RE = re.compile(r"sleep the engine|Sleep mode freed")
 WOKE_RE = re.compile(r"It took ([\d.]+) seconds to wake up")
+# A client asking for the model: a chat or completion request. In responsive
+# mode the dashboard wakes the engine itself when it sees one of these land
+# while the engine is asleep.
+WAKE_REQUEST_RE = re.compile(r"^(POST|GET)\s+/v1/(chat/completions|completions)\b")
 TS_RE = re.compile(r"^(\d{4}-\d\d-\d\dT[\d:.]+Z?)\s+")
 NOISY_PATHS = {"/health", "/metrics", "/ping", "/version"}
 
@@ -504,10 +535,14 @@ class DockerLogSource:
     """Tails one container over the Docker socket and parses vLLM's chatter."""
 
     def __init__(self, socket_path: str, container: str, on_event: Callable[[str, str], None],
-                 tail: int = 200, show_noisy: bool = False):
+                 tail: int = 200, show_noisy: bool = False,
+                 on_wake_request: Callable[..., None] | None = None):
         self.socket_path = socket_path
         self.container = container
         self.on_event = on_event
+        # Fired for every /v1/chat/completions and /v1/completions access line;
+        # the owner decides whether to wake the engine (responsive mode).
+        self.on_wake_request = on_wake_request
         self.tail = tail
         self.show_noisy = show_noisy
         self.connected = False
@@ -586,6 +621,12 @@ class DockerLogSource:
             key = f"{method} {path}"
             self.access_counts[key] = self.access_counts.get(key, 0) + 1
             base_path = path.split("?")[0]
+            # Any chat/completion request is a wake opportunity, whatever the
+            # HTTP status ends up being -- an asleep engine answers none of
+            # them well.
+            wake_cb = getattr(self, "on_wake_request", None)
+            if wake_cb and WAKE_REQUEST_RE.match(f"{method} {base_path}"):
+                wake_cb(method, base_path)
             if base_path in NOISY_PATHS and not self.show_noisy:
                 return
             kind = "request" if status.startswith("2") else "bad-request"

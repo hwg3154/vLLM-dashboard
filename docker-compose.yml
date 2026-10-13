@@ -30,6 +30,13 @@ services:
       ENABLE_CONTROLS: ${ENABLE_CONTROLS:-1}
       CONTROL_TOKEN: ${CONTROL_TOKEN:-}
       SLEEP_LEVEL: ${SLEEP_LEVEL:-2}
+      # Auto-sleep after N minutes without token generation (0 = off); the
+      # dashboard's "sleep after" input overrides it for the session.
+      AUTO_SLEEP_MINUTES: ${AUTO_SLEEP_MINUTES:-10}
+      # manual = only the Wake button wakes the engine; responsive = the
+      # dashboard wakes it itself when a /v1/chat/completions request lands
+      # in the logs. The dashboard's toggle overrides it for the session.
+      WAKE_MODE: ${WAKE_MODE:-manual}
       # nvidia-smi only. "utility" means no CUDA runtime is injected.
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: utility

@@ -188,6 +188,17 @@
   /* engine controls sit apart from the view controls: they change the server */
   .sep { display: inline-flex; gap: 6px; margin-left: 4px;
          padding-left: 10px; border-left: 1px solid var(--rule); }
+  .sep .cfg { display: inline-flex; align-items: center; gap: 4px;
+              font-size: 11px; color: var(--faint); white-space: nowrap; }
+  .sep .cfg input {
+    width: 44px; font: inherit; font-size: 12px; text-align: right;
+    color: var(--ink); background: transparent; border: 1px solid var(--rule);
+    border-radius: 3px; padding: 2px 5px;
+  }
+  .sep .cfg input:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+  .sep .cfg button { padding: 2px 8px; font-size: 11px; }
+  .sleep-note { font-size: 11px; color: var(--faint); margin-left: 8px; }
+  .sleep-note.busy { color: var(--amber); }
   button[disabled] { opacity: .45; cursor: default; }
   button.danger:hover { color: var(--amber); border-color: rgba(242,169,59,.5);
                         border-color: color-mix(in srgb, currentColor 50%, transparent); }
@@ -226,7 +237,18 @@
       <span class="sep" id="control-group" hidden>
         <button id="btn-wake" title="POST /wake_up on vLLM">Wake</button>
         <button id="btn-sleep" class="danger" title="POST /sleep on vLLM: frees VRAM">Sleep</button>
+        <label class="cfg" title="Put the engine to sleep after this many minutes without token generation. 0 = never. Session only.">
+          <span>sleep after</span>
+          <input id="sleep-minutes" type="number" min="0" max="1440" step="1" inputmode="numeric">
+          <span>min</span>
+        </label>
+        <span class="cfg">
+          <span>wake</span>
+          <button id="mode-manual" aria-pressed="true" title="Wake only via the Wake button above">manual</button>
+          <button id="mode-responsive" aria-pressed="false" title="The dashboard wakes the engine itself when it sees a /v1/chat/completions request in the logs">responsive</button>
+        </span>
       </span>
+      <span class="sleep-note" id="sleep-note" title="Auto-sleep status"></span>
     </div>
   </header>
 
@@ -879,8 +901,66 @@ async function tick() {
   renderEndpoints(data.vllm, data.logs);
   renderGpu(data.gpu);
   renderCharts((data.gpu && data.gpu.gpus ? data.gpu.gpus.length : 0) || 1);
-  $("control-group").hidden = !(data.config && data.config.controls_enabled);
+  renderSleepControls(data.sleep, data.config);
 }
+
+/* ---------- auto-sleep controls ---------- */
+// The server is the source of truth for the session settings; the UI only
+// mirrors it. The input is left alone while the user is typing in it.
+function renderSleepControls(sleep, config) {
+  const group = $("control-group");
+  group.hidden = !(config && config.controls_enabled);
+  if (group.hidden || !sleep) return;
+  const input = $("sleep-minutes");
+  if (document.activeElement !== input) input.value = sleep.idle_minutes;
+  $("mode-manual").setAttribute("aria-pressed", String(sleep.wake_mode === "manual"));
+  $("mode-responsive").setAttribute("aria-pressed", String(sleep.wake_mode === "responsive"));
+
+  const note = $("sleep-note");
+  if (sleep.note) {
+    note.textContent = sleep.note;
+    note.classList.add("busy");
+  } else {
+    note.classList.remove("busy");
+    if (!sleep.enabled) {
+      note.textContent = "auto-sleep off";
+    } else {
+      const mode = sleep.wake_mode === "responsive" ? "responsive wake" : "manual wake";
+      note.textContent = `auto-sleep ${sleep.idle_minutes}m · ${mode}`;
+      if (sleep.idle_s !== null && sleep.would_sleep_in_s !== null) {
+        note.textContent += ` · idle ${Math.round(sleep.idle_s / 60)}/${sleep.idle_minutes}m`;
+      }
+    }
+  }
+}
+
+function postConfig(body) {
+  fetch("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then((r) => r.json().catch(() => ({})))
+    .then((d) => {
+      if (!d.ok) state.controlError = "auto-sleep setting — " + (d.error || "rejected");
+      else state.controlError = null;
+    })
+    .catch((e) => (state.controlError = "auto-sleep setting — " + e));
+  tick();
+}
+
+$("sleep-minutes").addEventListener("change", () => {
+  const input = $("sleep-minutes");
+  const minutes = parseFloat(input.value);
+  if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440) {
+    input.value = (state.last && state.last.sleep && state.last.sleep.idle_minutes) || 10;
+    return;
+  }
+  postConfig({ auto_sleep_minutes: Math.round(minutes * 10) / 10 });
+});
+
+$("mode-manual").addEventListener("click", () => postConfig({ wake_mode: "manual" }));
+$("mode-responsive").addEventListener("click", () => postConfig({ wake_mode: "responsive" }));
 
 /* ---------- engine control ---------- */
 // A token is only needed if the server sets CONTROL_TOKEN. Accept it once via
