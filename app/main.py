@@ -434,6 +434,14 @@ async def index(request) -> FileResponse:
     return FileResponse(STATIC / "index.html")
 
 
+async def favicon_svg(request) -> FileResponse:
+    return FileResponse(STATIC / "favicon.svg", media_type="image/svg+xml")
+
+
+async def favicon_ico(request) -> FileResponse:
+    return FileResponse(STATIC / "favicon.ico", media_type="image/x-icon")
+
+
 async def healthz(request) -> JSONResponse:
     return JSONResponse({"ok": True, "metrics": store.vllm.get("ok", False)})
 
@@ -469,6 +477,8 @@ async def lifespan(app):
 app = Starlette(
     routes=[
         Route("/", index),
+        Route("/favicon.svg", favicon_svg),
+        Route("/favicon.ico", favicon_ico),
         Route("/api/state", api_state),
         Route("/api/control/sleep", api_sleep, methods=["POST"]),
         Route("/api/control/wake", api_wake, methods=["POST"]),
