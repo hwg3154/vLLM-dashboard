@@ -81,10 +81,12 @@
   .wrap { max-width: 1320px; margin: 0 auto; padding: 20px 22px 48px; }
 
   /* header */
-  header { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; padding-bottom: 14px; }
+  header { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+           min-width: 0; max-width: 100%; padding-bottom: 14px; }
   h1 { font-size: 17px; font-weight: 620; letter-spacing: -0.01em; margin: 0; }
-  .model { color: var(--muted); font-size: 13px; }
-  .health { margin-left: auto; display: flex; gap: 14px; align-items: center; }
+  .model { color: var(--muted); font-size: 13px; min-width: 0; overflow-wrap: anywhere; }
+  .health { margin-left: auto; display: flex; flex-wrap: wrap; align-items: center;
+            gap: 14px 14px; row-gap: 8px; min-width: 0; max-width: 100%; }
   .health span { color: var(--faint); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
   .health span.up { color: var(--muted); }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
@@ -154,10 +156,10 @@
   /* log feed */
   .feed { font-family: var(--mono); font-size: 12px; line-height: 1.75; max-height: 300px;
           overflow-y: auto; margin: 0; padding: 0; list-style: none; }
-  .feed li { display: flex; gap: 10px; white-space: nowrap; }
+  .feed li { display: flex; gap: 10px; white-space: nowrap; min-width: 0; }
   .feed time { color: var(--faint); flex: none; }
   .feed .k { flex: none; width: 44px; color: var(--faint); }
-  .feed .t { overflow: hidden; text-overflow: ellipsis; }
+  .feed .t { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
   .feed .request .k { color: var(--teal); }
   .feed .wake .k, .feed .state .k { color: var(--amber); }
   .feed .error .k, .feed .warn .k, .feed .bad-request .k { color: var(--rust); }
@@ -188,8 +190,9 @@
   button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
   .controls { display: flex; gap: 6px; }
   /* engine controls sit apart from the view controls: they change the server */
-  .sep { display: inline-flex; gap: 6px; margin-left: 4px;
-         padding-left: 10px; border-left: 1px solid var(--rule); }
+  .sep { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: 4px;
+         padding-left: 10px; border-left: 1px solid var(--rule);
+         min-width: 0; max-width: 100%; row-gap: 6px; }
   .sep .cfg { display: inline-flex; align-items: center; gap: 4px;
               font-size: 11px; color: var(--faint); white-space: nowrap; }
   .sep .cfg input {
@@ -199,7 +202,8 @@
   }
   .sep .cfg input:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
   .sep .cfg button { padding: 2px 8px; font-size: 11px; }
-  .sleep-note { font-size: 11px; color: var(--faint); margin-left: 8px; }
+  .sleep-note { font-size: 11px; color: var(--faint); margin-left: 8px;
+                min-width: 0; max-width: 100%; white-space: normal; }
   .sleep-note.busy { color: var(--amber); }
   button[disabled] { opacity: .45; cursor: default; }
   button.danger:hover { color: var(--amber); border-color: rgba(242,169,59,.5);
@@ -220,6 +224,22 @@
   @media (max-width: 620px) {
     .row.c4 { grid-template-columns: 1fr; }
     .big { font-size: 46px; }
+  }
+  /* Phones: the control row is wider than the screen. If it cannot wrap, the
+     layout viewport grows to fit it and the browser scales the whole page
+     down, so the column breakpoints above never match. Stack the menu and
+     give the buttons a real tap size. */
+  @media (max-width: 800px) {
+    .wrap { padding: 16px 14px 40px; }
+    header { align-items: flex-start; gap: 10px; }
+    .health { margin-left: 0; flex-basis: 100%; }
+    .sep { flex-basis: 100%; margin-left: 0; padding-left: 0; border-left: none;
+           border-top: 1px solid var(--rule); padding-top: 8px; margin-top: 2px; }
+    .sleep-note { flex-basis: 100%; margin-left: 0; line-height: 1.45; }
+    button, .sep .cfg button { padding: 6px 11px; min-height: 34px; }
+    .sep .cfg input { min-height: 34px; width: 52px; }
+    .hero-top { gap: 14px 22px; }
+    .panel h2 .aside.controls { float: none; display: flex; flex-wrap: wrap; margin-top: 8px; }
   }
 </style>
 </head>
